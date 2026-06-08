@@ -1,0 +1,32 @@
+ROLE: Senior Backend Engineer (Python)
+
+ROLE SUMMARY:
+We are hiring a senior backend engineer to design and operate high-throughput
+services. The ideal candidate is comfortable owning systems end to end, from API
+design through deployment and on-call.
+
+MUST-HAVES (heavily penalise if missing):
+- 5+ years professional software engineering experience
+- Strong Python (production systems, not just scripting)
+- REST API design and relational databases (PostgreSQL or similar)
+- Cloud experience (AWS preferred) and containerisation (Docker)
+- Demonstrated ownership of production services
+
+NICE-TO-HAVES (reward but do not require):
+- Infrastructure-as-code (Terraform/CloudFormation)
+- Event-driven / streaming systems (Kafka, SQS)
+- Experience mentoring engineers
+- Open-source contributions
+
+RED FLAGS (call these out explicitly in red_flags):
+- Job hopping (multiple stints under ~12 months without explanation)
+- Unexplained employment gaps
+- Vague, responsibility-free descriptions ("involved in", "helped with")
+- Missing the core tech stack (no Python / no cloud)
+- Formatting errors or careless presentation in the CV
+
+SCORING GUIDANCE:
+- skills_match_score reflects fit against the MUST-HAVES first, then NICE-TO-HAVES.
+- Be a strict recruiter. Do not be generous. A score of 90+ means an exceptional,
+  clear match across all must-haves with strong nice-to-haves.
+

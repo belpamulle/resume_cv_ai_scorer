@@ -1,0 +1,16 @@
+/.vscode/
+/test.json
+
+# Secrets and local config
+.env
+
+# Output / generated data
+candidates.csv
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+

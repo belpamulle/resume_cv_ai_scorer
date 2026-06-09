@@ -1,0 +1,13 @@
+LICENSE
+NOTICE
+README.md
+cv_assessor.py
+pyproject.toml
+cv_assessor.egg-info/PKG-INFO
+cv_assessor.egg-info/SOURCES.txt
+cv_assessor.egg-info/dependency_links.txt
+cv_assessor.egg-info/entry_points.txt
+cv_assessor.egg-info/requires.txt
+cv_assessor.egg-info/top_level.txt
+tests/test_email.py
+tests/test_parsing.py

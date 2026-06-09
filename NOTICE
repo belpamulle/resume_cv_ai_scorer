@@ -1,0 +1,20 @@
+CV Assessor
+Copyright 2026 The CV Assessor Authors
+
+This product includes software developed by the CV Assessor Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+------------------------------------------------------------------------
+IMPORTANT - Responsible use
+------------------------------------------------------------------------
+This software scores human job applicants using a large language model.
+Automated assessment of candidates is a high-risk activity under several
+regulatory frameworks (e.g. the EU AI Act, and US EEOC guidance). The
+output is decision-support only and MUST be reviewed by a human. It must
+not be used to automatically reject candidates. See the "Responsible &
+ethical use" section of README.md before deploying.

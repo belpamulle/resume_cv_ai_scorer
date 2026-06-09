@@ -1,5 +1,21 @@
-boto3>=1.34.0
-anthropic>=0.39.0
+# Convenience "install everything" pin set.
+#
+# Prefer the optional extras in pyproject.toml so you only pull the SDK for the
+# provider you actually use, e.g.:
+#
+#   pip install -e ".[bedrock]"     # Amazon Bedrock only
+#   pip install -e ".[anthropic]"   # Anthropic API only
+#   pip install -e ".[gateway]"     # OpenAI-compatible gateway (LiteLLM) only
+#   pip install -e ".[all]"         # every provider
+#   pip install -e ".[all,dev]"     # every provider + test/lint tooling
+#
+# This file installs the core deps plus all three provider SDKs.
+
+# Core (always required)
 tenacity>=8.2.0
 python-dotenv>=1.0.0
 
+# Provider SDKs (install only what you need via extras instead)
+boto3>=1.34.0
+anthropic>=0.39.0
+openai>=1.40.0

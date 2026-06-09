@@ -1,0 +1,66 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cv-assessor"
+version = "0.1.0"
+description = "Fault-tolerant batch CV scorer: reads job-application emails over IMAP and scores attached PDF CVs with a Claude model (Bedrock, Anthropic, or an OpenAI-compatible gateway)."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.9"
+authors = [{ name = "The CV Assessor Authors" }]
+keywords = ["cv", "resume", "screening", "hiring", "llm", "claude", "bedrock", "imap"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Office/Business",
+    "Topic :: Utilities",
+]
+
+# Core runtime deps shared by every provider. The heavy SDKs are optional extras
+# below so users install only the provider they actually use.
+dependencies = [
+    "tenacity>=8.2.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+bedrock = ["boto3>=1.34.0"]
+anthropic = ["anthropic>=0.39.0"]
+gateway = ["openai>=1.40.0"]
+# Convenience: install every provider SDK at once.
+all = ["boto3>=1.34.0", "anthropic>=0.39.0", "openai>=1.40.0"]
+# Development / CI tooling.
+dev = ["pytest>=7.4.0", "ruff>=0.5.0"]
+
+[project.urls]
+Homepage = "https://github.com/your-org/cv-assessor"
+Repository = "https://github.com/your-org/cv-assessor"
+Issues = "https://github.com/your-org/cv-assessor/issues"
+Changelog = "https://github.com/your-org/cv-assessor/blob/main/CHANGELOG.md"
+
+[project.scripts]
+cv-assessor = "cv_assessor:main"
+
+[tool.setuptools]
+py-modules = ["cv_assessor"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+# BLE001 (blind except) is intentional in this script: a batch must never abort
+# on one bad email, so several broad excepts are deliberate and annotated.
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,2 @@
+[console_scripts]
+cv-assessor = cv_assessor:main

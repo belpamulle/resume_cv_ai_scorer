@@ -14,4 +14,4 @@ __pycache__/
 .venv/
 venv/
 .idea
-
+/.idea/

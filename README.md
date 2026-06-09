@@ -1,0 +1,243 @@
+# CV Assessor
+
+Fault-tolerant batch script that reads job-application emails over IMAP, scores each attached PDF CV using a Claude model (Amazon Bedrock, Anthropic API, or an OpenAI-compatible AI gateway like LiteLLM), and appends structured results to a CSV — ready to import into Google Sheets or Excel.
+
+[![CI](https://github.com/your-org/cv-assessor/actions/workflows/ci.yml/badge.svg)](https://github.com/your-org/cv-assessor/actions/workflows/ci.yml)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
+> ## ⚠️ Responsible & ethical use — read this first
+>
+> CV Assessor uses a large language model to score **real people** applying for
+> jobs. Automated assessment of candidates is a **high-risk** activity:
+>
+> - The **EU AI Act** classifies AI systems used for recruitment and candidate
+>   evaluation as *high-risk*, with specific obligations on deployers.
+> - In the US, the **EEOC** and several state/city laws (e.g. NYC Local Law 144)
+>   scrutinise automated employment-decision tools for discriminatory impact.
+>
+> **By using this tool you agree to operate it responsibly:**
+>
+> 1. **Human-in-the-loop is mandatory.** The score is *decision support only*. A
+>    qualified person must review every candidate. Do **not** wire the output to
+>    automatic shortlisting or rejection.
+> 2. **No automated rejection.** Never reject a candidate based solely on a model
+>    score or `red_flags`.
+> 3. **Bias risk is real.** LLMs can reproduce and amplify bias relating to
+>    gender, ethnicity, age, disability, name origin, education, employment gaps
+>    (including parental/medical leave), and more. Validate outputs for adverse
+>    impact before relying on them, and keep your `criteria.txt` job-relevant.
+> 4. **Be transparent and lawful.** Tell candidates if automated tooling is used
+>    where required, honour data-subject rights, and confirm your legal basis for
+>    processing under your local privacy law (e.g. GDPR, the Australian Privacy
+>    Act, CCPA).
+>
+> This software is provided "as is" without warranty (see [LICENSE](LICENSE)). The
+> authors accept no liability for hiring decisions made with it. You are
+> responsible for compliance in your jurisdiction.
+
+## Privacy & data handling (PII)
+
+This tool processes **personal data**. Be deliberate about where it goes:
+
+- **`candidates.csv` contains PII** (names, emails, phone numbers, assessment
+  notes). It is **git-ignored by default** (along with all `*.csv`) — keep it
+  that way. Store and dispose of it according to your retention policy.
+- **CVs are sent to a third-party LLM provider.** The raw PDF bytes of each CV
+  leave your machine and are transmitted to whichever provider you configure
+  (Amazon Bedrock, Anthropic, or your gateway) for processing. Make sure that is
+  permitted by your candidate-privacy notice and your data-processing agreements,
+  and prefer a provider/region that meets your data-residency requirements.
+- **Secrets live in `.env`**, which is also git-ignored. Never commit real
+  credentials. `.env.example` ships with placeholders only.
+- The opt-in acknowledgement email sends a **neutral receipt only** — never the
+  score, red flags, or any assessment data.
+
+## How it works
+
+1. Connects to your IMAP inbox and fetches all matching emails (date-filtered or all).
+2. Reads the sender address from the email envelope (`From:` header).
+3. Extracts the first PDF attachment and sends the raw bytes directly to Claude (no local PDF parsing).
+4. Forces Claude to return a strict JSON score object, then immediately appends the row to `candidates.csv` with `fsync`.
+5. Skips already-processed messages on rerun — safe to interrupt and resume at any point.
+
+## Supported providers
+
+| `PROVIDER` | Backend | Install extra | Required config |
+|---|---|---|---|
+| `bedrock` | Amazon Bedrock (`converse` API, native PDF) | `pip install -e ".[bedrock]"` | `BEDROCK_MODEL_ID` (+ AWS creds or `AWS_BEARER_TOKEN_BEDROCK`) |
+| `anthropic` | Anthropic Messages API (base64 PDF) | `pip install -e ".[anthropic]"` | `ANTHROPIC_API_KEY`, `ANTHROPIC_MODEL_ID` |
+| `gateway` | OpenAI-compatible gateway, e.g. LiteLLM (PDF via data-URI) | `pip install -e ".[gateway]"` | `GATEWAY_BASE_URL`, `GATEWAY_API_KEY`, `GATEWAY_MODEL_ID` |
+
+The chosen model **must support native PDF / document input.** You only need to
+install the extra for the provider you actually use.
+
+## Setup
+
+```bash
+cp .env.example .env             # fill in your IMAP credentials and API keys
+
+# Install ONLY the provider you need (lighter footprint):
+pip install -e ".[gateway]"      # or ".[bedrock]" / ".[anthropic]"
+# ...or install everything at once:
+pip install -e ".[all]"
+# ...or the classic way:
+pip install -r requirements.txt
+
+python cv_assessor.py
+```
+
+Edit `criteria.txt` to describe the role, must-haves, nice-to-haves, and red flags before running.
+
+### Command-line usage
+
+After install you also get a `cv-assessor` console command. CLI flags override
+the matching `.env` values:
+
+```bash
+cv-assessor --help
+cv-assessor --provider gateway --limit 25 --since 01-Jan-2026
+cv-assessor --dry-run                       # see what WOULD be processed, no API calls
+python cv_assessor.py --dry-run             # equivalent without installing the script
+```
+
+| Flag | Overrides | Description |
+|---|---|---|
+| `--provider {bedrock,anthropic,gateway}` | `PROVIDER` | Model backend to use |
+| `--limit N` | `MAX_EMAILS` | Process at most N emails this run |
+| `--since DD-Mon-YYYY` | `IMAP_SINCE_DATE` | Only fetch mail on/after this date |
+| `--criteria-file PATH` | `CRITERIA_FILE` | Hiring-criteria file |
+| `--output-csv PATH` | `OUTPUT_CSV` | Output CSV path |
+| `--dry-run` | — | List which emails have a PDF CV without calling the model, sending mail, or writing the CSV (only IMAP access needed) |
+| `--version` | — | Print version and exit |
+
+`--dry-run` is the recommended first step on a new mailbox: it verifies IMAP
+connectivity and shows you exactly which messages would be scored.
+
+## Configuration (`.env`)
+
+| Variable | Description |
+|---|---|
+| `PROVIDER` | `bedrock`, `anthropic`, or `gateway` |
+| `IMAP_HOST` / `IMAP_USER` / `IMAP_PASSWORD` | Mailbox credentials |
+| `IMAP_SINCE_DATE` | Optional date filter, e.g. `01-Jan-2026` |
+| `MAX_EMAILS` | Optional cap on emails processed per run |
+| `BEDROCK_ENDPOINT_URL` | Custom Bedrock gateway URL (leave blank for AWS default) |
+| `AWS_BEARER_TOKEN_BEDROCK` | Bedrock API key (bearer auth) |
+| `AWS_REGION` / `BEDROCK_MODEL_ID` | Bedrock region and model |
+| `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL_ID` | Anthropic credentials and model |
+| `ANTHROPIC_BASE_URL` | Optional base-URL override for proxies/gateways |
+| `GATEWAY_BASE_URL` | OpenAI-compatible gateway URL (e.g. LiteLLM, include `/v1`) |
+| `GATEWAY_API_KEY` | Bearer token from the gateway's self-service portal |
+| `GATEWAY_MODEL_ID` | Model ID as listed in the gateway (must support PDF input) |
+| `OUTPUT_CSV` | Output file (default: `candidates.csv`) |
+| `REQUEST_DELAY_SECONDS` | Pause between API calls to avoid throttling |
+| `SEND_ACK` | Opt-in (`true`/`false`, default `false`). Send a neutral acknowledgement email to each applicant with a CV attached |
+| `SMTP_HOST` / `SMTP_PORT` | SMTP server and port (default port `587`, STARTTLS) |
+| `SMTP_USER` / `SMTP_PASSWORD` | SMTP login credentials |
+| `ACK_FROM` | From address for the acknowledgement email |
+| `ACK_SUBJECT` | Subject line (default: `We've received your application`) |
+| `ACK_TEMPLATE_FILE` | Plain-text body template (default: `response_email_template.txt`) |
+| `ACK_RATE_LIMIT` | Max acknowledgement sends per rolling window (default `139`; `0` disables) |
+| `ACK_RATE_PERIOD_SECONDS` | Length of the rolling window in seconds (default `3600`) |
+
+Only the credentials for the chosen `PROVIDER` need to be set.
+
+## Output
+
+Each processed email becomes one CSV row. Example (abridged):
+
+| candidate_name | candidate_email | years_experience | skills_match_score | red_flags | status | ack_status |
+|---|---|---|---|---|---|---|
+| Ada Lovelace | ada@example.com | 9 | 88 | | OK | SENT |
+| Grace Hopper | grace@example.com | 12 | 74 | Job hopping | OK | SENT |
+| (no CV attached) | sender@example.com | | | | NO_PDF | SKIPPED |
+| Alan Turing | turing@example.com | | | ThrottlingException… | API_ERROR | SENT |
+
+Full column set:
+
+`message_id`, `candidate_email`, `candidate_phone`, `candidate_name`, `years_experience`, `skills_match_score` (0–100), `red_flags`, `two_sentence_summary`, `source_from_header`, `status`, `ack_status`, `scored_at`
+
+- `status` is one of: `OK` · `NO_PDF` · `API_ERROR`
+- `ack_status` is one of: `SENT` · `FAILED` · `SKIPPED` (skipped when `SEND_ACK` is off, the address is blank, or no CV was attached)
+
+## Supported attachments
+
+CVs are processed as **PDF only, by design** — the raw PDF bytes are passed
+straight to the model with no local parsing. Other formats (`.docx`, `.doc`,
+`.rtf`, `.txt`, images) are ignored, and an email whose only attachment is one of
+those is recorded as `NO_PDF`. If you need `.docx` support, convert to PDF before
+the mailbox stage (e.g. a LibreOffice/`soffice --convert-to pdf` step), or open a
+feature request. PDF-only keeps the pipeline simple and avoids brittle local
+document parsing.
+
+## Acknowledgement emails (opt-in)
+
+When `SEND_ACK=true`, after scoring each email that had a CV attached the script sends the applicant a **neutral receipt** — a plain "we have received your application, thank you" message read from `response_email_template.txt`. It contains **no score, no red flags, and no assessment data whatsoever**. Edit `response_email_template.txt` to customise the wording; use the `[first_name]` placeholder to personalise it (it is replaced with the applicant's first name, falling back to "there").
+
+The acknowledgement is sent to the candidate's **own email address as read from inside the CV**, not the envelope `From:` address. This matters for applications that arrive through job boards / advertising relays (e.g. `Name via itpro.lk <…@itpro.lk>`), where the envelope address belongs to the platform rather than the applicant. The original envelope is still recorded in the `source_from_header` column. If the CV contains no email at all, the script falls back to the envelope address. (Scoring failures — `API_ERROR` — have no parsed CV email, so they fall back to the envelope address.)
+
+A single SMTP connection is opened once and reused for the whole batch. When `SEND_ACK=false` no SMTP connection is made. A send failure never aborts the batch and never loses a score — it is just recorded as `ack_status=FAILED`. Adding the `ack_status` column changes the CSV header, so start a fresh `candidates.csv` when enabling this feature.
+
+**Resilient SMTP:** the initial connect (`SMTP → STARTTLS → login`, 30s timeout) retries transient connection failures up to 5 times with exponential backoff; bad credentials fail fast (no pointless retries). During the batch, if the server drops the connection mid-run, the next send detects it, transparently reconnects, and resends once before recording `FAILED` — so one dropped socket no longer cascades into every later applicant being marked `FAILED`. All connection drops, reconnects, and send failures are logged.
+
+**Outgoing rate limit:** to respect SMTP provider caps, sends are throttled by a rolling-window limiter — at most `ACK_RATE_LIMIT` acknowledgement emails per `ACK_RATE_PERIOD_SECONDS` (default 139 per hour, i.e. under a 140/hour limit). The script runs at full speed until the cap is reached, then sleeps just long enough for the oldest send to age out of the window, then continues; the wait is logged. Only real send attempts consume the budget — `SKIPPED` messages (no CV, blank address, or `SEND_ACK=false`) never count. Scoring and CSV writing are not throttled, only the email sends. Set `ACK_RATE_LIMIT=0` to disable. Note: the window is in-memory, so stopping and restarting the script resets the counter — if you restart within the hour you could exceed the cap for that hour.
+
+## Fault tolerance
+
+- Rows are written and `fsync`'d after every email — a crash loses nothing already scored.
+- Exponential backoff (up to 6 retries) on provider rate-limit errors.
+- Emails without a PDF attachment are recorded as `NO_PDF` and skipped gracefully.
+- One bad email never aborts the batch.
+
+## Troubleshooting
+
+**`404` / `NotFoundError` from the gateway (`PROVIDER=gateway`).** This usually
+means the URL or model couldn't be found, not that the CV failed. Check, in order:
+1. `GATEWAY_BASE_URL` includes the version path your gateway expects (most
+   OpenAI-compatible gateways need a trailing **`/v1`**). A missing or doubled
+   `/v1` is the most common cause of a 404.
+2. `GATEWAY_MODEL_ID` exactly matches an ID listed in your gateway portal — a
+   typo or an unrouted model returns 404.
+3. The model actually supports **PDF/file input**. A text-only model will reject
+   the `file` content block.
+
+**`pip install` of `anthropic`/`openai`/`boto3` is blocked or fails** (e.g. on a
+corporate mirror that doesn't carry a package). Install only the provider you can
+reach — the SDKs are independent optional extras: `pip install -e ".[bedrock]"`
+or `".[gateway]"`. The other SDKs are imported lazily and aren't needed unless
+you select that provider.
+
+**`ThrottlingException` / `429` / `rate exceeded`.** The tool already retries with
+exponential backoff (up to 6 attempts). For large backlogs raise
+`REQUEST_DELAY_SECONDS` to pace requests, or run with `--limit` in smaller chunks.
+
+**Everything comes back `NO_PDF`.** The CV must be a real PDF attachment. The
+script intentionally does **not** use the IMAP `HAS ATTACHMENT` flag (unreliable
+across servers) — it walks every part and matches `application/pdf` or a `.pdf`
+filename. Non-PDF formats (`.docx`, links to cloud drives, inline images) are
+ignored. Use `--dry-run` to see per-message detection.
+
+**`AuthenticationError` / login failures.** For Bedrock, ensure either standard
+AWS credentials are available or `AWS_BEARER_TOKEN_BEDROCK` is set. For IMAP/SMTP
+with Gmail and similar, you typically need an **app password**, not your normal
+account password.
+
+**Re-running re-scores everything.** It shouldn't — resume keys off `message_id`
+in the existing `OUTPUT_CSV`. If you changed `OUTPUT_CSV` or deleted the file, the
+de-dup history is gone. Keep the same CSV to resume.
+
+## Development & tests
+
+```bash
+pip install -e ".[all,dev]"
+ruff check .
+pytest -q
+```
+
+The test suite is network-free (no IMAP/SMTP/provider calls) and covers the
+parsing/coercion layer, email PDF extraction, and CLI handling. CI runs `ruff` +
+`pytest` on Python 3.9–3.12. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## License
+
+[Apache License 2.0](LICENSE). See also [NOTICE](NOTICE).

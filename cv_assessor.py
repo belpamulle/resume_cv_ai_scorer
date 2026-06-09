@@ -3,8 +3,9 @@
 CV Assessor - fault-tolerant batch CV scorer.
 
 Reads a backlog of job-application emails over IMAP, sends each attached PDF CV
-directly to a Claude model (Amazon Bedrock or Anthropic API) using native PDF
-ingestion, and append-writes the structured score to a CSV after every response.
+directly to a Claude model (Amazon Bedrock, Anthropic API, or an OpenAI-compatible
+AI gateway such as LiteLLM) using native PDF ingestion, and append-writes the
+structured score to a CSV after every response.
 
 Design priorities:
   - Crash-safe: each row is flushed + fsync'd immediately; a crash on email #847
@@ -12,14 +13,20 @@ Design priorities:
   - Robust IMAP: searches by date/ALL (never the unreliable HAS ATTACHMENT) and
     reads the real sender from the envelope From header.
   - Native PDF: raw .pdf bytes are passed straight to the model, no local parsing.
-  - Pluggable provider: switch between Bedrock and Anthropic via the PROVIDER env var.
+  - Pluggable provider: switch between Bedrock, Anthropic, and an OpenAI-compatible
+    gateway via the PROVIDER env var.
 
 Usage:
     cp .env.example .env   # then fill in your values
-    pip install -r requirements.txt
+    pip install -e ".[gateway]"   # or [bedrock] / [anthropic] / [all]
     python cv_assessor.py
+    # or, after install, the console entry point:
+    cv-assessor --provider gateway --limit 10 --dry-run
+
+CLI flags override the matching .env values (see --help).
 """
 
+import argparse
 import base64
 import csv
 import email
@@ -28,10 +35,12 @@ import json
 import logging
 import os
 import re
+import smtplib
 import sys
 import time
+from collections import deque
 from datetime import datetime, timezone
-from email.message import Message
+from email.message import EmailMessage, Message
 from email.utils import parseaddr
 
 from dotenv import load_dotenv
@@ -50,9 +59,12 @@ logging.basicConfig(
 )
 log = logging.getLogger("cv_assessor")
 
+__version__ = "0.1.0"
+
 CSV_COLUMNS = [
     "message_id",
     "candidate_email",
+    "candidate_phone",
     "candidate_name",
     "years_experience",
     "skills_match_score",
@@ -60,6 +72,7 @@ CSV_COLUMNS = [
     "two_sentence_summary",
     "source_from_header",
     "status",
+    "ack_status",
     "scored_at",
 ]
 
@@ -70,6 +83,7 @@ CSV_COLUMNS = [
 class Config:
     def __init__(self) -> None:
         load_dotenv()
+        self.dry_run = False
         self.provider = os.getenv("PROVIDER", "bedrock").strip().lower()
 
         # IMAP
@@ -91,16 +105,67 @@ class Config:
         self.anthropic_base_url = os.getenv("ANTHROPIC_BASE_URL", "").strip()
         self.anthropic_model_id = os.getenv("ANTHROPIC_MODEL_ID", "").strip()
 
+        # Gateway (LiteLLM / OpenAI-compatible)
+        self.gateway_base_url = os.getenv("GATEWAY_BASE_URL", "").strip()
+        self.gateway_api_key = os.getenv("GATEWAY_API_KEY", "").strip()
+        self.gateway_model_id = os.getenv("GATEWAY_MODEL_ID", "").strip()
+
         # App
         self.criteria_file = os.getenv("CRITERIA_FILE", "criteria.txt").strip()
         self.output_csv = os.getenv("OUTPUT_CSV", "candidates.csv").strip()
         self.request_delay = float(os.getenv("REQUEST_DELAY_SECONDS", "1") or 0)
+
+        # Acknowledgement email (opt-in)
+        self.send_ack = os.getenv("SEND_ACK", "false").strip().lower() == "true"
+        self.smtp_host = os.getenv("SMTP_HOST", "").strip()
+        self.smtp_port = int(os.getenv("SMTP_PORT", "587") or 587)
+        self.smtp_user = os.getenv("SMTP_USER", "").strip()
+        self.smtp_password = os.getenv("SMTP_PASSWORD", "")
+        self.ack_from = os.getenv("ACK_FROM", "").strip()
+        self.ack_subject = os.getenv("ACK_SUBJECT", "We've received your application").strip()
+        self.ack_template_file = os.getenv(
+            "ACK_TEMPLATE_FILE", "response_email_template.txt"
+        ).strip()
+        # Rolling-window send limiter: at most ACK_RATE_LIMIT acknowledgement
+        # sends per ACK_RATE_PERIOD_SECONDS. Set ACK_RATE_LIMIT=0 to disable.
+        self.ack_rate_limit = int(os.getenv("ACK_RATE_LIMIT", "139") or 0)
+        self.ack_rate_period = float(os.getenv("ACK_RATE_PERIOD_SECONDS", "3600") or 3600)
+
+    def apply_overrides(self, args: argparse.Namespace) -> None:
+        """Apply CLI flags on top of the .env-derived values (flags win)."""
+        if getattr(args, "provider", None):
+            self.provider = args.provider.strip().lower()
+        if getattr(args, "since", None) is not None:
+            self.imap_since_date = args.since.strip()
+        if getattr(args, "limit", None) is not None:
+            self.max_emails = args.limit
+        if getattr(args, "criteria_file", None):
+            self.criteria_file = args.criteria_file.strip()
+        if getattr(args, "output_csv", None):
+            self.output_csv = args.output_csv.strip()
+        if getattr(args, "dry_run", False):
+            self.dry_run = True
 
     def validate(self) -> None:
         missing = []
         for key in ("imap_host", "imap_user", "imap_password"):
             if not getattr(self, key):
                 missing.append(key.upper())
+
+        # A dry run never calls the model or sends mail, so provider and SMTP
+        # credentials are not required - only IMAP access to list the backlog.
+        if self.dry_run:
+            if self.provider not in ("bedrock", "anthropic", "gateway"):
+                raise SystemExit(
+                    f"Unknown PROVIDER '{self.provider}'. "
+                    "Use 'bedrock', 'anthropic', or 'gateway'."
+                )
+            if missing:
+                raise SystemExit(
+                    "Missing required configuration: " + ", ".join(missing) +
+                    ". Copy .env.example to .env and fill it in."
+                )
+            return
 
         if self.provider == "bedrock":
             if not self.bedrock_model_id:
@@ -110,16 +175,40 @@ class Config:
                 missing.append("ANTHROPIC_API_KEY")
             if not self.anthropic_model_id:
                 missing.append("ANTHROPIC_MODEL_ID")
+        elif self.provider == "gateway":
+            if not self.gateway_base_url:
+                missing.append("GATEWAY_BASE_URL")
+            if not self.gateway_api_key:
+                missing.append("GATEWAY_API_KEY")
+            if not self.gateway_model_id:
+                missing.append("GATEWAY_MODEL_ID")
         else:
             raise SystemExit(
-                f"Unknown PROVIDER '{self.provider}'. Use 'bedrock' or 'anthropic'."
+                f"Unknown PROVIDER '{self.provider}'. "
+                "Use 'bedrock', 'anthropic', or 'gateway'."
             )
+
+        if self.send_ack:
+            for key in ("smtp_host", "smtp_user", "smtp_password", "ack_from"):
+                if not getattr(self, key):
+                    missing.append(key.upper())
 
         if missing:
             raise SystemExit(
                 "Missing required configuration: " + ", ".join(missing) +
                 ". Copy .env.example to .env and fill it in."
             )
+
+        if self.send_ack:
+            if not os.path.exists(self.ack_template_file):
+                raise SystemExit(
+                    f"Acknowledgement template file not found: {self.ack_template_file}"
+                )
+            with open(self.ack_template_file, "r", encoding="utf-8") as fh:
+                if not fh.read().strip():
+                    raise SystemExit(
+                        f"Acknowledgement template file is empty: {self.ack_template_file}"
+                    )
 
 
 def _int_or_none(value):
@@ -144,13 +233,16 @@ Evaluate the attached PDF CV against the following hiring criteria:
 {criteria}
 --- END CRITERIA ---
 
-The candidate's email address (taken from the email envelope) is: {from_email}
+The email arrived from this envelope address: {from_email}
+NOTE: this may be a job-board / advertising relay (e.g. "Name via somesite.com"),
+NOT the candidate's real address. Always prefer the email written inside the CV.
 
 Respond with ONLY a single valid JSON object and nothing else (no markdown, no
 code fences, no commentary). The object MUST match exactly this schema:
 
 {{
-  "candidate_email": "string - mirror back exactly: {from_email}",
+  "candidate_email": "string - the candidate's OWN email address as written in the CV. Only if the CV contains no email at all, fall back to the envelope address {from_email}",
+  "candidate_phone": "string - the candidate's phone/mobile number exactly as written in the CV, or '' if not found",
   "candidate_name": "string - the candidate's full name from the CV, or 'Unknown'",
   "years_experience": integer - total years of relevant professional experience,
   "skills_match_score": integer 0-100 - fit against the criteria (must-haves first),
@@ -161,7 +253,8 @@ code fences, no commentary). The object MUST match exactly this schema:
 Rules:
 - years_experience and skills_match_score MUST be integers.
 - red_flags MUST be a JSON array of strings (use [] if there are none).
-- candidate_email MUST be exactly: {from_email}
+- candidate_email MUST be the candidate's own email taken from the CV; use the
+  envelope address {from_email} only when the CV contains no email whatsoever.
 - Output the JSON object only."""
 
 
@@ -267,6 +360,54 @@ class AnthropicProvider:
         return _call_with_retry(self._raw_call, pdf_bytes, from_email, criteria)
 
 
+class GatewayProvider:
+    """OpenAI-compatible gateway (e.g. LiteLLM) with native PDF via file data-URI."""
+
+    def __init__(self, cfg: Config) -> None:
+        import openai
+
+        self.client = openai.OpenAI(
+            api_key=cfg.gateway_api_key,
+            base_url=cfg.gateway_base_url,
+        )
+        self.model_id = cfg.gateway_model_id
+        self._rate_limit_exc = openai.RateLimitError
+        self._api_exc = openai.APIStatusError
+
+    def _raw_call(self, pdf_bytes: bytes, prompt_text: str) -> str:
+        b64 = base64.standard_b64encode(pdf_bytes).decode("ascii")
+        data_uri = f"data:application/pdf;base64,{b64}"
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model_id,
+                max_tokens=1024,
+                temperature=0,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {"type": "file", "file": {
+                            "filename": "cv.pdf",
+                            "file_data": data_uri,
+                        }},
+                        {"type": "text", "text": prompt_text},
+                    ],
+                }],
+            )
+        except self._rate_limit_exc as exc:
+            raise RetryableError(str(exc)) from exc
+        except self._api_exc as exc:
+            if getattr(exc, "status_code", None) in (429, 500, 502, 503, 529):
+                raise RetryableError(str(exc)) from exc
+            raise ProviderError(str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise ProviderError(str(exc)) from exc
+
+        return response.choices[0].message.content or ""
+
+    def score_cv(self, pdf_bytes: bytes, from_email: str, criteria: str) -> dict:
+        return _call_with_retry(self._raw_call, pdf_bytes, from_email, criteria)
+
+
 def _looks_throttled(exc: Exception) -> bool:
     text = str(exc).lower()
     return any(s in text for s in ("throttl", "too many requests", "429", "rate exceeded"))
@@ -290,6 +431,8 @@ def make_provider(cfg: Config):
         return BedrockProvider(cfg)
     if cfg.provider == "anthropic":
         return AnthropicProvider(cfg)
+    if cfg.provider == "gateway":
+        return GatewayProvider(cfg)
     raise SystemExit(f"Unknown PROVIDER '{cfg.provider}'.")
 
 
@@ -307,6 +450,7 @@ def parse_model_json(raw_text: str, from_email: str) -> dict:
 
     return {
         "candidate_email": str(obj.get("candidate_email") or from_email).strip(),
+        "candidate_phone": str(obj.get("candidate_phone") or "").strip(),
         "candidate_name": str(obj.get("candidate_name") or "Unknown").strip(),
         "years_experience": _coerce_int(obj.get("years_experience")),
         "skills_match_score": _coerce_int(obj.get("skills_match_score")),
@@ -401,6 +545,19 @@ def extract_from_email(msg: Message) -> str:
     return addr.strip()
 
 
+def extract_first_name(msg: Message, candidate_name: str = "") -> str:
+    """Best-effort first name: prefer the scored CV name, fall back to the
+    display name in the From header, else empty."""
+    name = (candidate_name or "").strip()
+    if name and name.lower() != "unknown":
+        return name.split()[0]
+    display, _addr = parseaddr(msg.get("From", ""))
+    display = display.strip()
+    if display:
+        return display.split()[0]
+    return ""
+
+
 def extract_message_id(msg: Message, fallback: bytes) -> str:
     mid = (msg.get("Message-ID") or "").strip()
     return mid if mid else f"UID-{fallback.decode(errors='replace')}"
@@ -420,6 +577,163 @@ def extract_first_pdf(msg: Message):
         if payload:
             return payload
     return None
+
+
+# ---------------------------------------------------------------------------
+# Acknowledgement email
+# ---------------------------------------------------------------------------
+def render_ack_body(template: str, first_name: str) -> str:
+    name = (first_name or "").strip() or "there"
+    return template.replace("[first_name]", name)
+
+
+class RateLimiter:
+    """Rolling-window limiter: allows at most `limit` events per `period` seconds.
+
+    `acquire()` blocks (sleeps) when the cap is reached, until the oldest event
+    ages out of the window, then records the new event. Keyed off a monotonic
+    clock so it is immune to wall-clock adjustments. State is in-memory only, so
+    the window resets if the process is restarted.
+    """
+
+    def __init__(self, limit: int, period: float) -> None:
+        self.limit = limit
+        self.period = period
+        self._events = deque()
+
+    def _purge(self, now: float) -> None:
+        while self._events and now - self._events[0] >= self.period:
+            self._events.popleft()
+
+    def acquire(self) -> None:
+        if self.limit <= 0:
+            return
+        now = time.monotonic()
+        self._purge(now)
+        if len(self._events) >= self.limit:
+            sleep_for = self.period - (now - self._events[0])
+            if sleep_for > 0:
+                log.info(
+                    "Acknowledgement rate cap reached (%d per %.0fs); sleeping %.0fs.",
+                    self.limit, self.period, sleep_for,
+                )
+                time.sleep(sleep_for)
+            self._purge(time.monotonic())
+        self._events.append(time.monotonic())
+
+
+# Connection-level failures worth a reconnect/retry (NOT recipient/auth errors).
+SMTP_CONNECTION_ERRORS = (
+    smtplib.SMTPServerDisconnected,
+    smtplib.SMTPConnectError,
+    smtplib.SMTPHeloError,
+    OSError,  # socket errors, timeouts, connection reset, DNS, etc.
+)
+
+SMTP_CONNECT_TIMEOUT = 30
+
+
+@retry(
+    retry=retry_if_exception_type(SMTP_CONNECTION_ERRORS),
+    wait=wait_exponential(multiplier=2, min=2, max=30),
+    stop=stop_after_attempt(5),
+    before_sleep=before_sleep_log(log, logging.WARNING),
+    reraise=True,
+)
+def _smtp_connect(cfg: "Config") -> smtplib.SMTP:
+    """Open + STARTTLS + login, retrying transient connection failures.
+    Authentication errors are NOT retried (they re-raise immediately)."""
+    log.info("Connecting to SMTP %s:%s as %s", cfg.smtp_host, cfg.smtp_port, cfg.smtp_user)
+    smtp = smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=SMTP_CONNECT_TIMEOUT)
+    try:
+        smtp.starttls()
+        smtp.login(cfg.smtp_user, cfg.smtp_password)
+    except Exception:
+        try:
+            smtp.close()
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    log.info("SMTP connection established.")
+    return smtp
+
+
+class SmtpMailer:
+    """Holds one reusable SMTP connection that transparently reconnects when the
+    server drops it part-way through a long batch."""
+
+    def __init__(self, cfg: "Config") -> None:
+        self.cfg = cfg
+        self.smtp = None
+
+    def connect(self) -> None:
+        self.smtp = _smtp_connect(self.cfg)
+
+    def _drop(self) -> None:
+        if self.smtp is not None:
+            try:
+                self.smtp.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self.smtp = None
+
+    def close(self) -> None:
+        if self.smtp is not None:
+            try:
+                self.smtp.quit()
+            except Exception:  # noqa: BLE001
+                pass
+            self.smtp = None
+
+    def send(self, to_email: str, body: str, in_reply_to: str = None) -> None:
+        """Send one ack. On a dropped connection, reconnect once and resend.
+        Raises if it still fails (caller records FAILED)."""
+        msg = EmailMessage()
+        msg["From"] = self.cfg.ack_from
+        msg["To"] = to_email
+        msg["Subject"] = self.cfg.ack_subject
+        if in_reply_to:
+            msg["In-Reply-To"] = in_reply_to
+            msg["References"] = in_reply_to
+        msg.set_content(body)
+
+        attempts = 2
+        for attempt in range(1, attempts + 1):
+            try:
+                if self.smtp is None:
+                    self.connect()
+                self.smtp.send_message(msg)
+                return
+            except SMTP_CONNECTION_ERRORS as exc:
+                # Connection-level problem: drop the dead socket and reconnect.
+                log.warning(
+                    "SMTP connection lost while sending to %s (attempt %d/%d): %s",
+                    to_email, attempt, attempts, exc,
+                )
+                self._drop()
+                if attempt == attempts:
+                    raise
+
+
+def attempt_ack(mailer, cfg: "Config", to_email: str, template: str,
+                first_name: str, in_reply_to: str = None, limiter=None) -> str:
+    """Guarded send. Returns ack_status: SENT / FAILED / SKIPPED. Never raises.
+
+    The rate limiter is consumed only for real send attempts (after the SKIPPED
+    guards), so skipped messages never count against the hourly budget. A send
+    that ends up FAILED still consumes a slot, since the server may have accepted
+    the message before the failure - this keeps us safely under the cap."""
+    if not cfg.send_ack or mailer is None or not (to_email or "").strip():
+        return "SKIPPED"
+    try:
+        body = render_ack_body(template, first_name)
+        if limiter is not None:
+            limiter.acquire()
+        mailer.send(to_email, body, in_reply_to)
+        return "SENT"
+    except Exception as exc:  # noqa: BLE001 - a send failure must not abort the batch
+        log.error("Acknowledgement send failed for %s: %s", to_email, exc)
+        return "FAILED"
 
 
 # ---------------------------------------------------------------------------
@@ -464,12 +778,133 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def _tally_ack(counts: dict, ack_status: str) -> None:
+    if ack_status == "SENT":
+        counts["ack_sent"] += 1
+    elif ack_status == "FAILED":
+        counts["ack_failed"] += 1
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+def parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="cv-assessor",
+        description=(
+            "Batch-score job-application PDF CVs from an IMAP inbox with a Claude "
+            "model. CLI flags override the matching .env values."
+        ),
+        epilog=(
+            "Reminder: output is decision-support only and must be reviewed by a "
+            "human. Do not use it to automatically reject candidates."
+        ),
+    )
+    parser.add_argument(
+        "--provider",
+        choices=["bedrock", "anthropic", "gateway"],
+        help="Model backend to use (overrides PROVIDER).",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        metavar="N",
+        help="Process at most N emails this run (overrides MAX_EMAILS).",
+    )
+    parser.add_argument(
+        "--since",
+        metavar="DD-Mon-YYYY",
+        help="Only fetch mail on/after this date, e.g. 01-Jan-2026 (overrides IMAP_SINCE_DATE).",
+    )
+    parser.add_argument(
+        "--criteria-file",
+        dest="criteria_file",
+        help="Path to the hiring-criteria file (overrides CRITERIA_FILE).",
+    )
+    parser.add_argument(
+        "--output-csv",
+        dest="output_csv",
+        help="Path to the output CSV (overrides OUTPUT_CSV).",
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "List what would be processed (which emails have a PDF CV) without "
+            "calling the model, sending acknowledgements, or writing the CSV. "
+            "Only IMAP access is required."
+        ),
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
+    )
+    return parser.parse_args(argv)
+
+
+def run_dry(cfg: Config) -> int:
+    """List the backlog and whether each message has a PDF CV. No model calls,
+    no acknowledgements, no CSV writes."""
+    processed = load_processed_ids(cfg.output_csv)
+    if processed:
+        log.info("Resume: %d already-processed messages would be skipped.", len(processed))
+
+    conn = None
+    counts = {"would_score": 0, "no_pdf": 0, "already_done": 0}
+    try:
+        conn = connect_imap(cfg)
+        msg_ids = search_message_ids(conn, cfg)
+        total = len(msg_ids)
+        log.info("DRY RUN: found %d messages to consider (provider=%s).", total, cfg.provider)
+        for idx, msg_id in enumerate(msg_ids, start=1):
+            try:
+                msg = fetch_message(conn, msg_id)
+            except Exception as exc:  # noqa: BLE001
+                log.error("[%d/%d] fetch failed for %r: %s", idx, total, msg_id, exc)
+                continue
+            message_id = extract_message_id(msg, msg_id)
+            from_email = extract_from_email(msg) or "unknown"
+            if message_id in processed:
+                counts["already_done"] += 1
+                log.info("[%d/%d] %s -> ALREADY PROCESSED (skip)", idx, total, from_email)
+                continue
+            if extract_first_pdf(msg):
+                counts["would_score"] += 1
+                log.info("[%d/%d] %s -> WOULD SCORE (PDF found)", idx, total, from_email)
+            else:
+                counts["no_pdf"] += 1
+                log.info("[%d/%d] %s -> NO_PDF (skip)", idx, total, from_email)
+    except KeyboardInterrupt:
+        log.warning("Interrupted by user.")
+    finally:
+        if conn is not None:
+            try:
+                conn.logout()
+            except Exception:  # noqa: BLE001
+                pass
+
+    log.info(
+        "DRY RUN complete. WOULD_SCORE=%d NO_PDF=%d ALREADY_PROCESSED=%d (nothing written).",
+        counts["would_score"], counts["no_pdf"], counts["already_done"],
+    )
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-def main() -> int:
+def main(argv=None) -> int:
+    args = parse_args(argv)
     cfg = Config()
+    cfg.apply_overrides(args)
     cfg.validate()
+
+    if cfg.dry_run:
+        if not os.path.exists(cfg.criteria_file):
+            log.warning("Criteria file not found: %s (not needed for --dry-run).", cfg.criteria_file)
+        log.info("Provider: %s (DRY RUN - no model calls will be made).", cfg.provider)
+        return run_dry(cfg)
 
     if not os.path.exists(cfg.criteria_file):
         raise SystemExit(f"Criteria file not found: {cfg.criteria_file}")
@@ -477,6 +912,23 @@ def main() -> int:
         criteria = fh.read().strip()
     if not criteria:
         raise SystemExit(f"Criteria file is empty: {cfg.criteria_file}")
+
+    ack_template = ""
+    ack_limiter = None
+    if cfg.send_ack:
+        with open(cfg.ack_template_file, "r", encoding="utf-8") as fh:
+            ack_template = fh.read()
+        log.info("Acknowledgement emails ENABLED (from %s).", cfg.ack_from)
+        if cfg.ack_rate_limit > 0:
+            ack_limiter = RateLimiter(cfg.ack_rate_limit, cfg.ack_rate_period)
+            log.info(
+                "Acknowledgement rate limit: max %d sends per %.0fs.",
+                cfg.ack_rate_limit, cfg.ack_rate_period,
+            )
+        else:
+            log.info("Acknowledgement rate limit disabled (ACK_RATE_LIMIT=0).")
+    else:
+        log.info("Acknowledgement emails disabled (SEND_ACK is not true).")
 
     log.info("Provider: %s", cfg.provider)
     provider = make_provider(cfg)
@@ -487,7 +939,9 @@ def main() -> int:
 
     conn = None
     fh = None
-    counts = {"ok": 0, "no_pdf": 0, "error": 0, "skipped": 0}
+    mailer = None
+    counts = {"ok": 0, "no_pdf": 0, "error": 0, "skipped": 0,
+              "ack_sent": 0, "ack_failed": 0}
     try:
         conn = connect_imap(cfg)
         msg_ids = search_message_ids(conn, cfg)
@@ -495,6 +949,10 @@ def main() -> int:
         log.info("Found %d messages to consider.", total)
 
         fh, writer = open_csv_for_append(cfg.output_csv)
+
+        if cfg.send_ack:
+            mailer = SmtpMailer(cfg)
+            mailer.connect()
 
         for idx, msg_id in enumerate(msg_ids, start=1):
             try:
@@ -515,42 +973,49 @@ def main() -> int:
             base_row = {
                 "message_id": message_id,
                 "candidate_email": from_email,
+                "candidate_phone": "",
                 "candidate_name": "",
                 "years_experience": "",
                 "skills_match_score": "",
                 "red_flags": "",
                 "two_sentence_summary": "",
                 "source_from_header": from_header,
+                "ack_status": "",
                 "scored_at": now_iso(),
             }
 
             pdf_bytes = extract_first_pdf(msg)
             if not pdf_bytes:
+                # No CV attached -> nothing to acknowledge per scope.
                 log.info("[%d/%d] no PDF for %s -> NO_PDF", idx, total, from_email or "unknown")
-                write_row(fh, writer, {**base_row, "status": "NO_PDF"})
+                write_row(fh, writer, {
+                    **base_row, "status": "NO_PDF", "ack_status": "SKIPPED",
+                })
                 processed.add(message_id)
                 counts["no_pdf"] += 1
                 continue
 
             try:
                 result = provider.score_cv(pdf_bytes, from_email, criteria)
-            except ProviderError as exc:
-                log.error("[%d/%d] scoring failed for %s: %s", idx, total, from_email, exc)
-                write_row(fh, writer, {
-                    **base_row,
-                    "status": "API_ERROR",
-                    "two_sentence_summary": str(exc)[:300],
-                })
-                processed.add(message_id)
-                counts["error"] += 1
-                continue
             except Exception as exc:  # noqa: BLE001 - never abort the batch
-                log.error("[%d/%d] unexpected error for %s: %s", idx, total, from_email, exc)
-                write_row(fh, writer, {
+                if isinstance(exc, ProviderError):
+                    log.error("[%d/%d] scoring failed for %s: %s", idx, total, from_email, exc)
+                else:
+                    log.error("[%d/%d] unexpected error for %s: %s", idx, total, from_email, exc)
+                # A CV was attached, so acknowledge regardless of the scoring failure.
+                row = {
                     **base_row,
                     "status": "API_ERROR",
                     "two_sentence_summary": str(exc)[:300],
-                })
+                }
+                ack_status = attempt_ack(
+                    mailer, cfg, from_email, ack_template,
+                    extract_first_name(msg), in_reply_to=message_id,
+                    limiter=ack_limiter,
+                )
+                row["ack_status"] = ack_status
+                _tally_ack(counts, ack_status)
+                write_row(fh, writer, row)
                 processed.add(message_id)
                 counts["error"] += 1
                 continue
@@ -558,6 +1023,7 @@ def main() -> int:
             row = {
                 **base_row,
                 "candidate_email": result["candidate_email"] or from_email,
+                "candidate_phone": result["candidate_phone"],
                 "candidate_name": result["candidate_name"],
                 "years_experience": result["years_experience"],
                 "skills_match_score": result["skills_match_score"],
@@ -565,12 +1031,19 @@ def main() -> int:
                 "two_sentence_summary": result["two_sentence_summary"],
                 "status": "OK",
             }
+            ack_status = attempt_ack(
+                mailer, cfg, row["candidate_email"], ack_template,
+                extract_first_name(msg, result["candidate_name"]),
+                in_reply_to=message_id, limiter=ack_limiter,
+            )
+            row["ack_status"] = ack_status
+            _tally_ack(counts, ack_status)
             write_row(fh, writer, row)
             processed.add(message_id)
             counts["ok"] += 1
             log.info(
-                "[%d/%d] scored %s -> %s",
-                idx, total, row["candidate_email"], row["skills_match_score"],
+                "[%d/%d] scored %s -> %s (ack=%s)",
+                idx, total, row["candidate_email"], row["skills_match_score"], ack_status,
             )
 
             if cfg.request_delay > 0:
@@ -586,10 +1059,13 @@ def main() -> int:
                 conn.logout()
             except Exception:  # noqa: BLE001
                 pass
+        if mailer is not None:
+            mailer.close()
 
     log.info(
-        "Done. OK=%d NO_PDF=%d ERROR=%d SKIPPED=%d -> %s",
-        counts["ok"], counts["no_pdf"], counts["error"], counts["skipped"], cfg.output_csv,
+        "Done. OK=%d NO_PDF=%d ERROR=%d SKIPPED=%d ACK_SENT=%d ACK_FAILED=%d -> %s",
+        counts["ok"], counts["no_pdf"], counts["error"], counts["skipped"],
+        counts["ack_sent"], counts["ack_failed"], cfg.output_csv,
     )
     return 0
 

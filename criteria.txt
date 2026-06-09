@@ -29,4 +29,3 @@ SCORING GUIDANCE:
 - skills_match_score reflects fit against the MUST-HAVES first, then NICE-TO-HAVES.
 - Be a strict recruiter. Do not be generous. A score of 90+ means an exceptional,
   clear match across all must-haves with strong nice-to-haves.
-
